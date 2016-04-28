@@ -140,9 +140,15 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     # find and use the bucket
     bucket = @s3.buckets[@bucket]
 
-    remote_filename = "#{@prefix}#{File.basename(file)}"
+    remote_filename = file.gsub(@temporary_directory, "").sub!(/^\//, '')
 
-    @logger.debug("S3: ready to write file in bucket", :remote_filename => remote_filename, :bucket => @bucket)
+		split = remote_filename.split(".")
+
+		split.pop
+
+		split << ""
+
+		@logger.info("write_on_bucket: #{remote_filename}")
 
     File.open(file, 'r') do |fileIO|
       begin
@@ -156,22 +162,6 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     end
 
     @logger.debug("S3: has written remote file in bucket with canned ACL", :remote_filename => remote_filename, :bucket  => @bucket, :canned_acl => @canned_acl)
-  end
-
-  # This method is used for create new empty temporary files for use. Flag is needed for indicate new subsection time_file.
-  public
-  def create_temporary_file
-    filename = File.join(@temporary_directory, get_temporary_filename(@page_counter))
-
-    @logger.debug("S3: Creating a new temporary file", :filename => filename)
-
-    @file_rotation_lock.synchronize do
-      unless @tempfile.nil?
-        @tempfile.close
-      end
-
-      @tempfile = File.open(filename, "a")
-    end
   end
 
   public
@@ -196,16 +186,18 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
       FileUtils.mkdir_p(@temporary_directory)
     end
 
+		@segregations = {}
+
     test_s3_write
 
     restore_from_crashes if @restore == true
-    reset_page_counter
-    create_temporary_file
+		register_segregation("test/test")
     configure_periodic_rotation if time_file != 0
-    configure_upload_workers
+		@segregations.delete("test/test")
+  #  configure_upload_workers
 
     @codec.on_event do |event, encoded_event|
-      handle_event(encoded_event)
+      handle_event(event, encoded_event)
     end
   end
 
@@ -216,8 +208,10 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   def test_s3_write
     @logger.debug("S3: Creating a test file on S3")
 
-    test_filename = File.join(@temporary_directory,
-                              "logstash-programmatic-access-test-object-#{Time.now.to_i}")
+    test_filename = File.join(
+			@temporary_directory,
+			"logstash-programmatic-access-test-object-#{Time.now.to_i}"
+		)
 
     File.open(test_filename, 'a') do |file|
       file.write('test')
@@ -230,7 +224,7 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
       File.delete(test_filename)
     end
   end
-  
+
   public
   def restore_from_crashes
     @logger.debug("S3: is attempting to verify previous crashes...")
@@ -243,37 +237,16 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   end
 
   public
-  def move_file_to_bucket(file)
-    if !File.zero?(file)
-      write_on_bucket(file)
-      @logger.debug("S3: file was put on the upload thread", :filename => File.basename(file), :bucket => @bucket)
-    end
-
-    begin
-      File.delete(file)
-    rescue Errno::ENOENT
-      # Something else deleted the file, logging but not raising the issue
-      @logger.warn("S3: Cannot delete the temporary file since it doesn't exist on disk", :filename => File.basename(file))
-    rescue Errno::EACCES
-      @logger.error("S3: Logstash doesnt have the permission to delete the file in the temporary directory.", :filename => File.basename(file), :temporary_directory => @temporary_directory)
-    end
-  end
-
-  public
   def periodic_interval
     @time_file * 60
   end
 
   public
-  def get_temporary_filename(page_counter = 0)
-    current_time = Time.now
-    filename = "ls.s3.#{Socket.gethostname}.#{current_time.strftime("%Y-%m-%dT%H.%M")}"
-
-    if @tags.size > 0
-      return "#{filename}.tag_#{@tags.join('.')}.part#{page_counter}.#{TEMPFILE_EXTENSION}"
-    else
-      return "#{filename}.part#{page_counter}.#{TEMPFILE_EXTENSION}"
-    end
+  def get_temporary_filename(directory, file, page_counter = 0)
+		# Just to make sure we don't over-write files from a 'concurrent' logstash instance
+		# this includes a node that was replaced and gets it's part number reset
+		rand_string = (0...8).map { (65 + rand(26)).chr }.join
+    return "#{@temporary_directory}/#{directory}/#{file}.part-#{page_counter}.#{rand_string}.#{TEMPFILE_EXTENSION}"
   end
 
   public
@@ -283,29 +256,15 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
   end
 
   public
-  def rotate_events_log?
+  def rotate_events_log? segregation
     @file_rotation_lock.synchronize do
-      @tempfile.size > @size_file
+      @segregations[segregation][:file].size > @size_file
     end
   end
 
   public
   def write_events_to_multiple_files?
     @size_file > 0
-  end
-
-  public
-  def write_to_tempfile(event)
-    begin
-      @logger.debug("S3: put event into tempfile ", :tempfile => File.basename(@tempfile))
-
-      @file_rotation_lock.synchronize do
-        @tempfile.syswrite(event)
-      end
-    rescue Errno::ENOSPC
-      @logger.error("S3: No space left in temporary directory", :temporary_directory => @temporary_directory)
-      teardown
-    end
   end
 
   public
@@ -325,78 +284,167 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
     @upload_queue << LogStash::ShutdownEvent
   end
 
-  private
-  def handle_event(encoded_event)
-    if write_events_to_multiple_files?
-      if rotate_events_log?
-        @logger.debug("S3: tempfile is too large, let's bucket it and create new file", :tempfile => File.basename(@tempfile))
+	private
+	def extract_base(segregation)
+		dirs = segregation.split("/")
+		dir = dirs[0..(dirs.length- 2)]
+		file = dirs[-1]
+		return [dir.join("/"), file]
+	end
 
-        move_file_to_bucket_async(@tempfile.path)
-        next_page
-        create_temporary_file
-      else
-        @logger.debug("S3: tempfile file size report.", :tempfile_size => @tempfile.size, :size_file => @size_file)
-      end
-    end 
+	private
+	def register_segregation segregation
+		# Register the aggregation (file pointer, page counter and timestamp)
+		unless @segregations.keys.include? segregation
+			@logger.info("register new segregation: #{segregation}")
 
-    write_to_tempfile(encoded_event)
-  end
+			directory, file = extract_base(segregation)
+			@logger.info(:directory => directory, :file => file)
 
-  private
-  def configure_periodic_rotation
-    @periodic_rotation_thread = Stud::Task.new do
-      LogStash::Util::set_thread_name("<S3 periodic uploader")
+			begin
+				temp_dir = @temporary_directory + "/" + directory
+				FileUtils.mkdir_p(temp_dir)
+				@logger.info("created directory: #{directory}")
+			
+				@segregations[segregation] = {
+					:start_time => Time.now.to_i,
+					:directory => directory,
+					:file_base => file,
+					:current_page => 0,
+					:file_pointers => {
+						0 => File.open(get_temporary_filename(directory, file, 0), 'a'),
+					}
+				}
+			rescue StandardError => e
+				@logger.info(e)
+				@logger.info("Failed to create temp directory")
+				raise e
+			end
+		end
+	end
 
-      Stud.interval(periodic_interval, :sleep_then_run => true) do
-        @logger.debug("S3: time_file triggered, bucketing the file", :filename => @tempfile.path)
+	def commit_locally(segregation, event, encoded_event)
+		seg = @segregations[segregation]
+		if seg[:file_pointers][seg[:current_page]].syswrite(encoded_event)
+			@logger.info("S3> commit_locally: write success (file: #{seg[:file_pointers][seg[:current_page]].path}")
+		else
+			# What do?
+			@logger.info("S3> commit_locally: write fail (file: #{seg[:file_pointers][seg[:current_page]].path}")
+		end
 
-        move_file_to_bucket_async(@tempfile.path)
-        next_page
-        create_temporary_file
-      end
-    end
-  end
+	end
 
-  private
-  def configure_upload_workers
-    @logger.debug("S3: Configure upload workers")
+	# Only based on file_size, time is in another thread
+	def should_commit?(segregation)
+		seg = @segregations[segregation]
+		if @size_file > 0 and seg[:file_pointers][seg[:current_page]].size > @size_file
+			@logger.info("S3> should_commit: upload because of size")
+			return true
+		end
 
-    @upload_workers = @upload_workers_count.times.map do |worker_id|
-      Stud::Task.new do
-        LogStash::Util::set_thread_name("<S3 upload worker #{worker_id}")
+		return false
+	end
 
-        while true do
-          @logger.debug("S3: upload worker is waiting for a new file to upload.", :worker_id => worker_id)
+	def commit(segregation)
+		current_page = @segregations[segregation][:current_page]
+		time_start = @segregations[segregation][:start_time]
 
-          upload_worker
-        end
-      end
-    end
-  end
+		next_page(segregation)
 
-  private
-  def upload_worker
-    file = @upload_queue.deq
+		Stud::Task.new do
+			LogStash::Util::set_thread_name("S3> thread: commit")
+			upload_and_delete(segregation, current_page, time_start)
+		end
 
-    case file
-      when LogStash::ShutdownEvent
-        @logger.debug("S3: upload worker is shutting down gracefuly")
-        @upload_queue.enq(LogStash::ShutdownEvent)
-      else
-        @logger.debug("S3: upload working is uploading a new file", :filename => File.basename(file))
-        move_file_to_bucket(file)
-    end
-  end
+	end
 
-  private
-  def next_page
-    @page_counter += 1
-  end
+	def upload_and_delete(segregation, page_to_upload, time_start)
+		begin
+			@logger.info("in thread")
+			seg = @segregations[segregation]
+			bucket = @s3.buckets[@bucket]
+			key = seg[:file_pointers][page_to_upload].path.gsub(@temporary_directory, "").sub!(/^\//, '')
+			@logger.info("write_on_bucket: #{key}")
+			@file_rotation_lock.synchronize do
+				@logger.info("#{segregation} size is #{seg[:file_pointers][page_to_upload].size}")
+				if seg[:file_pointers][page_to_upload].size > 0
+					File.open(seg[:file_pointers][page_to_upload].path, 'r') do |fileIO|
+						begin
+							# prepare for write the file
+							object = bucket.objects[key]
+							object.write(fileIO, :acl => @canned_acl)
+							@logger.debug("S3: has written remote file in bucket with canned ACL", :remote_filename => key, :bucket  => @bucket, :canned_acl => @canned_acl)
+						rescue AWS::Errors::Base => error
+							@logger.error("S3: AWS error", :error => error)
+							raise LogStash::Error, "AWS Configuration Error, #{error}"
+						end
+					end
+				else
+					@logger.info("don't upload: size <= 0")
+				end
 
-  private
-  def reset_page_counter
-    @page_counter = 0
-  end
+				FileUtils.rm(@segregations[segregation][:file_pointers][page_to_upload].path)
+				@segregations[segregation][:file_pointers].delete(page_to_upload)
+			end
+
+		rescue StandardError => e
+			@logger.info(e)
+			raise e
+		end
+
+	end
+
+	private
+	def handle_event(event, encoded_event)
+		segregation = event.sprintf(@prefix)
+
+		register_segregation(segregation)
+
+		commit_locally(segregation, event, encoded_event)
+
+		if should_commit? segregation
+			commit(segregation)
+		end
+	end
+
+	private
+	def configure_periodic_rotation
+		@periodic_rotation_thread = Stud::Task.new do
+			begin
+				LogStash::Util::set_thread_name("S3> thread: periodic_uploader")
+				begin
+					Stud.interval(periodic_interval, :sleep_then_run => true) do
+						begin
+							@logger.info("running periodic uploader ... but may not see new segregations")
+							@segregations.each { |segregation, values|
+								commit(segregation)
+							}
+						rescue StandardError => e
+							@logger.info(e)
+						end
+					end
+				rescue StandardError => e
+					@logger.info(e)
+				end
+			rescue StandardError => e
+				@logger.info(e)
+			end
+		end
+	end
+
+	private
+	def next_page( segregation )
+		seg = @segregations[segregation]
+		seg[:current_page] = seg[:current_page] + 1
+		seg[:file_pointers][seg[:current_page]] = File.open(
+			get_temporary_filename(
+				@segregations[segregation][:directory],
+				@segregations[segregation][:file_base],
+				@segregations[segregation][:current_page]
+			),
+		'a')
+	end
+
 
   private
   def delete_on_bucket(filename)
@@ -414,11 +462,5 @@ class LogStash::Outputs::S3 < LogStash::Outputs::Base
       @logger.error("S3: AWS error", :error => e)
       raise LogStash::ConfigurationError, "AWS Configuration Error"
     end
-  end
-
-  private
-  def move_file_to_bucket_async(file)
-    @logger.debug("S3: Sending the file to the upload queue.", :filename => File.basename(file))
-    @upload_queue.enq(file)
   end
 end
